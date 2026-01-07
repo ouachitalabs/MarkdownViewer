@@ -216,6 +216,7 @@ class DocumentState: ObservableObject {
     @Published var htmlContent: String = ""
     @Published var title: String = "Markdown Viewer"
     @Published var fileChanged: Bool = false
+    @Published var outlineItems: [OutlineItem] = []
     var currentURL: URL?
     private var fileMonitor: DispatchSourceFileSystemObject?
     private var lastModificationDate: Date?
@@ -238,14 +239,16 @@ class DocumentState: ObservableObject {
             let markdown = try String(contentsOf: url, encoding: .utf8)
             let (frontMatter, content) = parseFrontMatter(markdown)
             let document = Document(parsing: content)
-            var htmlVisitor = HTMLConverter()
-            let html = htmlVisitor.visit(document)
+            var renderer = MarkdownRenderer()
+            let rendered = renderer.render(document)
             let frontMatterHTML = renderFrontMatter(frontMatter)
-            self.htmlContent = wrapInHTML(frontMatterHTML + html, title: url.lastPathComponent)
+            self.htmlContent = wrapInHTML(frontMatterHTML + rendered.html, title: url.lastPathComponent)
             self.title = url.lastPathComponent
+            self.outlineItems = rendered.outline
         } catch {
             self.htmlContent = wrapInHTML("<p>Error loading file: \(error.localizedDescription)</p>", title: "Error")
             self.title = "Error"
+            self.outlineItems = []
         }
     }
 
@@ -532,21 +535,84 @@ class DocumentState: ObservableObject {
     }
 }
 
-struct HTMLConverter: MarkupWalker {
-    var result = ""
+struct OutlineItem: Identifiable {
+    let id = UUID()
+    let title: String
+    let level: Int
+    let anchorID: String
+}
 
-    mutating func visit(_ document: Document) -> String {
+struct RenderedMarkdown {
+    let html: String
+    let outline: [OutlineItem]
+}
+
+struct HeadingSlugger {
+    private var counts: [String: Int] = [:]
+
+    mutating func slug(for title: String) -> String {
+        let base = slugify(title)
+        let key = base.isEmpty ? "section" : base
+        let count = counts[key, default: 0]
+        counts[key] = count + 1
+        if count == 0 {
+            return key
+        }
+        return "\(key)-\(count)"
+    }
+
+    private func slugify(_ title: String) -> String {
+        let lowercased = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var result = ""
+        var needsHyphen = false
+
+        for scalar in lowercased.unicodeScalars {
+            guard scalar.isASCII else {
+                needsHyphen = true
+                continue
+            }
+            let value = scalar.value
+            let isLetter = value >= 97 && value <= 122
+            let isDigit = value >= 48 && value <= 57
+            if isLetter || isDigit {
+                if needsHyphen && !result.isEmpty {
+                    result.append("-")
+                }
+                needsHyphen = false
+                result.append(Character(scalar))
+            } else {
+                needsHyphen = true
+            }
+        }
+
+        return result
+    }
+}
+
+struct MarkdownRenderer: MarkupWalker {
+    var result = ""
+    var outline: [OutlineItem] = []
+    var slugger = HeadingSlugger()
+
+    mutating func render(_ document: Document) -> RenderedMarkdown {
         result = ""
+        outline = []
+        slugger = HeadingSlugger()
         for child in document.children {
             visit(child)
         }
-        return result
+        return RenderedMarkdown(html: result, outline: outline)
     }
 
     mutating func visit(_ markup: any Markup) {
         switch markup {
         case let heading as Heading:
-            result += "<h\(heading.level)>"
+            let title = heading.plainText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let anchorID = slugger.slug(for: title)
+            if !title.isEmpty {
+                outline.append(OutlineItem(title: title, level: heading.level, anchorID: anchorID))
+            }
+            result += "<h\(heading.level) id=\"\(anchorID)\">"
             for child in heading.children { visit(child) }
             result += "</h\(heading.level)>\n"
         case let paragraph as Paragraph:
@@ -667,9 +733,16 @@ final class WindowResolverView: NSView {
 
 struct ContentView: View {
     @StateObject private var documentState: DocumentState
+    @State private var isHoveringEdge = false
+    @State private var isHoveringSidebar = false
+    @State private var scrollRequest: ScrollRequest?
 
     init(documentState: DocumentState = DocumentState()) {
         _documentState = StateObject(wrappedValue: documentState)
+    }
+
+    private var showOutline: Bool {
+        isHoveringEdge || isHoveringSidebar
     }
 
     var body: some View {
@@ -689,7 +762,7 @@ struct ContentView: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
-                    WebView(htmlContent: documentState.htmlContent)
+                    WebView(htmlContent: documentState.htmlContent, scrollRequest: scrollRequest)
                 }
             }
 
@@ -719,19 +792,170 @@ struct ContentView: View {
             window.tabbingMode = .preferred
             window.documentState = documentState
         })
+        .overlay(alignment: .trailing) {
+            ZStack(alignment: .trailing) {
+                Color.clear
+                    .frame(width: 12)
+                    .contentShape(Rectangle())
+                    .onHover { hovering in
+                        isHoveringEdge = hovering
+                    }
+
+                if showOutline {
+                    OutlineSidebar(items: documentState.outlineItems) { item in
+                        scrollRequest = ScrollRequest(id: item.anchorID, token: UUID())
+                    }
+                    .onHover { hovering in
+                        isHoveringSidebar = hovering
+                    }
+                    .transition(.move(edge: .trailing))
+                }
+            }
+        }
     }
+}
+
+struct OutlineSidebar: View {
+    let items: [OutlineItem]
+    let onSelect: (OutlineItem) -> Void
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("OUTLINE")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.secondary)
+                Divider()
+                if items.isEmpty {
+                    Text("No headings")
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(items) { item in
+                        OutlineRow(item: item, onSelect: onSelect)
+                    }
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(width: 240, alignment: .topLeading)
+        .frame(maxHeight: .infinity, alignment: .topLeading)
+        .background(Color(NSColor.windowBackgroundColor).opacity(0.95))
+        .overlay(Divider(), alignment: .leading)
+    }
+}
+
+struct OutlineRow: View {
+    let item: OutlineItem
+    let onSelect: (OutlineItem) -> Void
+
+    private var indent: CGFloat {
+        CGFloat(max(item.level - 1, 0)) * 12
+    }
+
+    private var fontSize: CGFloat {
+        item.level == 1 ? 13 : 12
+    }
+
+    private var fontWeight: Font.Weight {
+        item.level == 1 ? .semibold : .regular
+    }
+
+    private var textColor: Color {
+        item.level <= 2 ? .primary : .secondary
+    }
+
+    var body: some View {
+        Button(action: {
+            onSelect(item)
+        }) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Circle()
+                    .fill(item.level <= 2 ? Color.accentColor : Color.secondary.opacity(0.6))
+                    .frame(width: 4, height: 4)
+                    .padding(.top, 4)
+                Text(item.title)
+                    .font(.system(size: fontSize, weight: fontWeight))
+                    .foregroundColor(textColor)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.vertical, 2)
+            .padding(.leading, indent)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct ScrollRequest: Equatable {
+    let id: String
+    let token: UUID
 }
 
 struct WebView: NSViewRepresentable {
     let htmlContent: String
+    let scrollRequest: ScrollRequest?
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
 
     func makeNSView(context: Context) -> WKWebView {
         let webView = WKWebView()
+        webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")
         return webView
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
-        webView.loadHTMLString(htmlContent, baseURL: nil)
+        if htmlContent != context.coordinator.lastHTML {
+            context.coordinator.lastHTML = htmlContent
+            context.coordinator.isLoading = true
+            webView.loadHTMLString(htmlContent, baseURL: nil)
+        }
+
+        if let request = scrollRequest {
+            context.coordinator.requestScroll(request, in: webView)
+        }
+    }
+
+    class Coordinator: NSObject, WKNavigationDelegate {
+        var lastHTML: String?
+        var pendingAnchor: String?
+        var pendingToken: UUID?
+        var lastHandledToken: UUID?
+        var isLoading = false
+
+        func requestScroll(_ request: ScrollRequest, in webView: WKWebView) {
+            guard request.token != lastHandledToken else { return }
+            pendingAnchor = request.id
+            pendingToken = request.token
+            if !isLoading {
+                performScroll(in: webView)
+            }
+        }
+
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+            isLoading = true
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            isLoading = false
+            performScroll(in: webView)
+        }
+
+        private func performScroll(in webView: WKWebView) {
+            guard let anchor = pendingAnchor, let token = pendingToken else { return }
+            pendingAnchor = nil
+            pendingToken = nil
+            lastHandledToken = token
+
+            let escaped = anchor
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "'", with: "\\'")
+            let script = "var el = document.getElementById('\(escaped)'); if (el) { el.scrollIntoView(); }"
+            webView.evaluateJavaScript(script, completionHandler: nil)
+        }
     }
 }
