@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+Markdown Viewer.app/
+AppIcon.iconset/
+*.xcodeproj
+xcuserdata/
+DerivedData/
+.DS_Store
