@@ -2,6 +2,8 @@
 
 A native macOS Markdown viewer built with SwiftUI and WebKit.
 
+![Screenshot](screenshot.png)
+
 ## Build & Run
 
 ```bash
