@@ -395,6 +395,7 @@ class DocumentState: ObservableObject {
     @Published var title: String = "Markdown Viewer"
     @Published var fileChanged: Bool = false
     @Published var outlineItems: [OutlineItem] = []
+    @Published var reloadToken: UUID?
     var currentURL: URL?
     private var fileMonitor: DispatchSourceFileSystemObject?
     private var lastModificationDate: Date?
@@ -492,6 +493,7 @@ class DocumentState: ObservableObject {
 
     func reload() {
         guard let url = currentURL else { return }
+        reloadToken = UUID()
         loadFile(at: url)
     }
 
@@ -952,7 +954,7 @@ struct ContentView: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
-                    WebView(htmlContent: documentState.htmlContent, scrollRequest: scrollRequest)
+                    WebView(htmlContent: documentState.htmlContent, scrollRequest: scrollRequest, reloadToken: documentState.reloadToken)
                 }
             }
 
@@ -1083,6 +1085,7 @@ struct ScrollRequest: Equatable {
 struct WebView: NSViewRepresentable {
     let htmlContent: String
     let scrollRequest: ScrollRequest?
+    let reloadToken: UUID?
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -1097,9 +1100,20 @@ struct WebView: NSViewRepresentable {
 
     func updateNSView(_ webView: WKWebView, context: Context) {
         if htmlContent != context.coordinator.lastHTML {
+            let shouldPreserveScroll = reloadToken != nil && reloadToken != context.coordinator.lastReloadToken
+            context.coordinator.lastReloadToken = reloadToken
             context.coordinator.lastHTML = htmlContent
             context.coordinator.isLoading = true
-            webView.loadHTMLString(htmlContent, baseURL: nil)
+
+            if shouldPreserveScroll {
+                let coordinator = context.coordinator
+                webView.evaluateJavaScript("window.scrollY") { result, _ in
+                    coordinator.savedScrollY = (result as? CGFloat) ?? 0
+                    webView.loadHTMLString(htmlContent, baseURL: nil)
+                }
+            } else {
+                webView.loadHTMLString(htmlContent, baseURL: nil)
+            }
         }
 
         if let request = scrollRequest {
@@ -1113,6 +1127,8 @@ struct WebView: NSViewRepresentable {
         var pendingToken: UUID?
         var lastHandledToken: UUID?
         var isLoading = false
+        var lastReloadToken: UUID?
+        var savedScrollY: CGFloat = 0
 
         func requestScroll(_ request: ScrollRequest, in webView: WKWebView) {
             guard request.token != lastHandledToken else { return }
@@ -1129,6 +1145,13 @@ struct WebView: NSViewRepresentable {
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             isLoading = false
+
+            if savedScrollY > 0 {
+                let scrollY = savedScrollY
+                savedScrollY = 0
+                webView.evaluateJavaScript("window.scrollTo(0, \(scrollY))", completionHandler: nil)
+            }
+
             performScroll(in: webView)
         }
 
