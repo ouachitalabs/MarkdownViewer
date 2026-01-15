@@ -65,6 +65,22 @@ struct MarkdownViewerApp: App {
                 }
                 .keyboardShortcut("r", modifiers: .command)
             }
+            CommandGroup(after: .toolbar) {
+                Button("Zoom In") {
+                    appDelegate.zoomIn()
+                }
+                .keyboardShortcut("+", modifiers: .command)
+
+                Button("Zoom Out") {
+                    appDelegate.zoomOut()
+                }
+                .keyboardShortcut("-", modifiers: .command)
+
+                Button("Actual Size") {
+                    appDelegate.resetZoom()
+                }
+                .keyboardShortcut("0", modifiers: .command)
+            }
         }
     }
 }
@@ -163,6 +179,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func reloadActiveDocument() {
         activeDocumentState()?.reload()
+    }
+
+    func zoomIn() {
+        activeDocumentState()?.zoomIn()
+    }
+
+    func zoomOut() {
+        activeDocumentState()?.zoomOut()
+    }
+
+    func resetZoom() {
+        activeDocumentState()?.resetZoom()
     }
 
     func selectNextTab() {
@@ -287,6 +315,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             tabGroupWindow.addTabbedWindow(window, ordered: .above)
         }
         windowController.showWindow(nil)
+        window.makeKeyAndOrderFront(nil)
         windowControllers.append(windowController)
     }
 }
@@ -396,6 +425,7 @@ class DocumentState: ObservableObject {
     @Published var fileChanged: Bool = false
     @Published var outlineItems: [OutlineItem] = []
     @Published var reloadToken: UUID?
+    @Published var zoomLevel: CGFloat = 1.0
     var currentURL: URL?
     private var fileMonitor: DispatchSourceFileSystemObject?
     private var lastModificationDate: Date?
@@ -495,6 +525,18 @@ class DocumentState: ObservableObject {
         guard let url = currentURL else { return }
         reloadToken = UUID()
         loadFile(at: url)
+    }
+
+    func zoomIn() {
+        zoomLevel = min(zoomLevel + 0.1, 3.0)
+    }
+
+    func zoomOut() {
+        zoomLevel = max(zoomLevel - 0.1, 0.5)
+    }
+
+    func resetZoom() {
+        zoomLevel = 1.0
     }
 
     private func startMonitoring(url: URL) {
@@ -954,7 +996,7 @@ struct ContentView: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
-                    WebView(htmlContent: documentState.htmlContent, scrollRequest: scrollRequest, reloadToken: documentState.reloadToken)
+                    WebView(htmlContent: documentState.htmlContent, scrollRequest: scrollRequest, reloadToken: documentState.reloadToken, zoomLevel: documentState.zoomLevel)
                 }
             }
 
@@ -1086,6 +1128,7 @@ struct WebView: NSViewRepresentable {
     let htmlContent: String
     let scrollRequest: ScrollRequest?
     let reloadToken: UUID?
+    let zoomLevel: CGFloat
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -1119,6 +1162,12 @@ struct WebView: NSViewRepresentable {
         if let request = scrollRequest {
             context.coordinator.requestScroll(request, in: webView)
         }
+
+        if zoomLevel != context.coordinator.lastZoomLevel {
+            context.coordinator.lastZoomLevel = zoomLevel
+            let percentage = Int(zoomLevel * 100)
+            webView.evaluateJavaScript("document.body.style.zoom = '\(percentage)%'", completionHandler: nil)
+        }
     }
 
     class Coordinator: NSObject, WKNavigationDelegate {
@@ -1129,6 +1178,7 @@ struct WebView: NSViewRepresentable {
         var isLoading = false
         var lastReloadToken: UUID?
         var savedScrollY: CGFloat = 0
+        var lastZoomLevel: CGFloat = 1.0
 
         func requestScroll(_ request: ScrollRequest, in webView: WKWebView) {
             guard request.token != lastHandledToken else { return }
@@ -1145,6 +1195,11 @@ struct WebView: NSViewRepresentable {
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             isLoading = false
+
+            if lastZoomLevel != 1.0 {
+                let percentage = Int(lastZoomLevel * 100)
+                webView.evaluateJavaScript("document.body.style.zoom = '\(percentage)%'", completionHandler: nil)
+            }
 
             if savedScrollY > 0 {
                 let scrollY = savedScrollY
