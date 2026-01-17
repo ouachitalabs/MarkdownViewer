@@ -26,6 +26,7 @@
 
 ## Commit & Pull Request Guidelines
 - Commit messages are short, imperative, and capitalized (e.g., "Add native tabbed windows").
+- Prefer closing issues directly in the commit message when available (e.g., include `Closes #123`).
 - PRs should include: a concise summary, testing steps, and screenshots for UI changes.
 - Link related issues when available.
 
