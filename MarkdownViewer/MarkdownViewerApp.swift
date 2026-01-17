@@ -1195,14 +1195,20 @@ struct ContentView: View {
     @StateObject private var documentState: DocumentState
     @State private var isHoveringEdge = false
     @State private var isHoveringSidebar = false
+    @State private var isOutlinePinned = false
     @State private var scrollRequest: ScrollRequest?
 
     init(documentState: DocumentState = DocumentState()) {
         _documentState = StateObject(wrappedValue: documentState)
     }
 
+    private var canShowOutline: Bool {
+        !documentState.htmlContent.isEmpty
+    }
+
     private var showOutline: Bool {
-        isHoveringEdge || isHoveringSidebar
+        guard canShowOutline else { return false }
+        return isOutlinePinned || isHoveringEdge || isHoveringSidebar
     }
 
     var body: some View {
@@ -1226,39 +1232,6 @@ struct ContentView: View {
                 }
             }
 
-            if documentState.fileChanged || documentState.isShowingFindBar {
-                VStack(alignment: .trailing, spacing: 8) {
-                    if documentState.fileChanged {
-                        Button(action: {
-                            documentState.reload()
-                        }) {
-                            HStack(spacing: 4) {
-                                Image(systemName: "arrow.clockwise")
-                                    .font(.system(size: 11, weight: .medium))
-                                Text("File changed")
-                                    .font(.system(size: 11, weight: .medium))
-                            }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(Color.orange.opacity(0.9))
-                            .foregroundColor(.white)
-                            .cornerRadius(6)
-                        }
-                        .buttonStyle(.plain)
-                    }
-
-                    if documentState.isShowingFindBar {
-                        FindBar(
-                            query: $documentState.findQuery,
-                            focusToken: documentState.findFocusToken,
-                            onNext: { documentState.findNext() },
-                            onPrevious: { documentState.findPrevious() },
-                            onClose: { documentState.hideFindBar() }
-                        )
-                    }
-                }
-                .padding(12)
-            }
         }
         .frame(minWidth: 600, minHeight: 400)
         .navigationTitle(documentState.title)
@@ -1297,6 +1270,62 @@ struct ContentView: View {
                     }
                     .transition(.move(edge: .trailing))
                 }
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            if canShowOutline || documentState.fileChanged || documentState.isShowingFindBar {
+                VStack(alignment: .trailing, spacing: 8) {
+                    if documentState.fileChanged {
+                        Button(action: {
+                            documentState.reload()
+                        }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.clockwise")
+                                    .font(.system(size: 11, weight: .medium))
+                                Text("File changed")
+                                    .font(.system(size: 11, weight: .medium))
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Color.orange.opacity(0.9))
+                            .foregroundColor(.white)
+                            .cornerRadius(6)
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    if documentState.isShowingFindBar {
+                        FindBar(
+                            query: $documentState.findQuery,
+                            focusToken: documentState.findFocusToken,
+                            onNext: { documentState.findNext() },
+                            onPrevious: { documentState.findPrevious() },
+                            onClose: { documentState.hideFindBar() }
+                        )
+                    }
+
+                    if canShowOutline {
+                        Button(action: {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                isOutlinePinned.toggle()
+                            }
+                        }) {
+                            Image(systemName: "sidebar.right")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundColor(isOutlinePinned ? .accentColor : .secondary)
+                                .padding(6)
+                        }
+                        .buttonStyle(.plain)
+                        .background(Color(NSColor.windowBackgroundColor).opacity(0.95))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(Color(NSColor.separatorColor))
+                        )
+                        .cornerRadius(6)
+                        .help(isOutlinePinned ? "Hide Table of Contents" : "Show Table of Contents")
+                    }
+                }
+                .padding(12)
             }
         }
     }
