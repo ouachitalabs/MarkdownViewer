@@ -367,6 +367,9 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate {
 
 private var documentStateKey: UInt8 = 0
 
+private let commentHeaderPrefix = "<!-- MarkdownViewer comments:"
+private let commentHeaderLine = "<!-- MarkdownViewer comments: Do not remove MV-COMMENT markers. They anchor inline comments. -->"
+
 private extension NSWindow {
     var documentState: DocumentState? {
         get {
@@ -461,6 +464,7 @@ class DocumentState: ObservableObject {
     @Published var title: String = "Markdown Viewer"
     @Published var fileChanged: Bool = false
     @Published var outlineItems: [OutlineItem] = []
+    @Published var comments: [MarkdownComment] = []
     @Published var reloadToken: UUID?
     @Published var zoomLevel: CGFloat = 1.0
     @Published var isShowingFindBar: Bool = false
@@ -471,6 +475,7 @@ class DocumentState: ObservableObject {
     private var fileMonitor: DispatchSourceFileSystemObject?
     private var lastModificationDate: Date?
     private let recentFilesStore: RecentFilesStore
+    private var markdownSource: String = ""
 
     init(recentFilesStore: RecentFilesStore = .shared) {
         self.recentFilesStore = recentFilesStore
@@ -487,24 +492,31 @@ class DocumentState: ObservableObject {
         recentFilesStore.add(url)
         do {
             let markdown = try String(contentsOf: url, encoding: .utf8)
-            let (frontMatter, content) = parseFrontMatter(markdown)
+            let frontMatterInfo = parseFrontMatter(markdown)
+            let content = frontMatterInfo.content
             let document = Document(parsing: content)
-            var renderer = MarkdownRenderer()
+            var renderer = MarkdownRenderer(source: content, sourceOffsetBase: frontMatterInfo.contentStartOffset)
             let rendered = renderer.render(document)
-            let frontMatterHTML = renderFrontMatter(frontMatter)
+            let frontMatterHTML = renderFrontMatter(frontMatterInfo.items)
             self.htmlContent = wrapInHTML(frontMatterHTML + rendered.html, title: url.lastPathComponent)
             self.title = url.lastPathComponent
             self.outlineItems = normalizedOutline(rendered.outline)
+            self.comments = parseComments(from: markdown)
+            self.markdownSource = markdown
         } catch {
             self.htmlContent = wrapInHTML("<p>Error loading file: \(error.localizedDescription)</p>", title: "Error")
             self.title = "Error"
             self.outlineItems = []
+            self.comments = []
+            self.markdownSource = ""
         }
     }
 
-    private func parseFrontMatter(_ markdown: String) -> ([(String, String)], String) {
+    private func parseFrontMatter(_ markdown: String) -> FrontMatterInfo {
         let lines = markdown.components(separatedBy: "\n")
-        guard lines.first == "---" else { return ([], markdown) }
+        guard lines.first == "---" else {
+            return FrontMatterInfo(items: [], content: markdown, contentStartOffset: 0, frontMatterEndOffset: 0)
+        }
 
         var frontMatter: [(String, String)] = []
         var endIndex = 0
@@ -524,14 +536,35 @@ class DocumentState: ObservableObject {
         }
 
         let content = lines.dropFirst(endIndex).joined(separator: "\n")
-        return (frontMatter, content)
+        let contentStartIndex = contentStartIndex(in: markdown, endIndex: endIndex)
+        let contentStartOffset = markdown.utf8.distance(from: markdown.utf8.startIndex, to: contentStartIndex)
+        return FrontMatterInfo(
+            items: frontMatter,
+            content: content,
+            contentStartOffset: contentStartOffset,
+            frontMatterEndOffset: contentStartOffset
+        )
+    }
+
+    private func contentStartIndex(in markdown: String, endIndex: Int) -> String.Index {
+        guard endIndex > 0 else { return markdown.startIndex }
+        var index = markdown.startIndex
+        var linesToSkip = endIndex
+        while linesToSkip > 0, index < markdown.endIndex {
+            guard let newlineIndex = markdown[index...].firstIndex(of: "\n") else {
+                return markdown.endIndex
+            }
+            index = markdown.index(after: newlineIndex)
+            linesToSkip -= 1
+        }
+        return index
     }
 
     private func renderFrontMatter(_ frontMatter: [(String, String)]) -> String {
         guard !frontMatter.isEmpty else { return "" }
 
         var html = """
-        <div class="front-matter">
+        <div class="front-matter" data-mv-frontmatter="true">
         <table class="front-matter-table">
         """
         for (key, value) in frontMatter {
@@ -560,6 +593,195 @@ class DocumentState: ObservableObject {
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")
             .replacingOccurrences(of: "\"", with: "&quot;")
+    }
+
+    func addComment(startOffset: Int, endOffset: Int, body: String) {
+        guard let url = currentURL else { return }
+        guard startOffset < endOffset else { return }
+        do {
+            var markdown = try String(contentsOf: url, encoding: .utf8)
+            let frontMatterInfo = parseFrontMatter(markdown)
+            let headerResult = ensureCommentHeader(in: markdown, insertionOffset: frontMatterInfo.frontMatterEndOffset)
+            markdown = headerResult.markdown
+
+            var adjustedStart = startOffset
+            var adjustedEnd = endOffset
+            if headerResult.insertedBytes > 0 {
+                if startOffset >= headerResult.insertionOffset {
+                    adjustedStart += headerResult.insertedBytes
+                }
+                if endOffset >= headerResult.insertionOffset {
+                    adjustedEnd += headerResult.insertedBytes
+                }
+            }
+
+            let existingComments = parseComments(from: markdown)
+            let newID = nextCommentID(from: existingComments)
+            let now = Date()
+            let comment = MarkdownComment(id: newID, created: now, updated: now, body: body)
+
+            guard let updatedMarkdown = insertCommentMarkers(
+                in: markdown,
+                startOffset: adjustedStart,
+                endOffset: adjustedEnd,
+                comment: comment
+            ) else {
+                return
+            }
+            try updatedMarkdown.write(to: url, atomically: true, encoding: .utf8)
+            loadFile(at: url)
+        } catch {
+            return
+        }
+    }
+
+    func updateComment(id: String, body: String) {
+        guard let url = currentURL else { return }
+        do {
+            let markdown = try String(contentsOf: url, encoding: .utf8)
+            guard let updatedMarkdown = updatingCommentPayload(in: markdown, id: id, body: body) else {
+                return
+            }
+            try updatedMarkdown.write(to: url, atomically: true, encoding: .utf8)
+            loadFile(at: url)
+        } catch {
+            return
+        }
+    }
+
+    func deleteComment(id: String) {
+        guard let url = currentURL else { return }
+        do {
+            let markdown = try String(contentsOf: url, encoding: .utf8)
+            guard let updatedMarkdown = removingCommentMarkers(in: markdown, id: id) else {
+                return
+            }
+            try updatedMarkdown.write(to: url, atomically: true, encoding: .utf8)
+            loadFile(at: url)
+        } catch {
+            return
+        }
+    }
+
+    private func parseComments(from markdown: String) -> [MarkdownComment] {
+        let pattern = "<!--\\s*MV-COMMENT-START\\s+({.*?})\\s*-->"
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else {
+            return []
+        }
+        let range = NSRange(markdown.startIndex..<markdown.endIndex, in: markdown)
+        let matches = regex.matches(in: markdown, options: [], range: range)
+        var comments: [MarkdownComment] = []
+
+        for match in matches {
+            guard match.numberOfRanges > 1,
+                  let jsonRange = Range(match.range(at: 1), in: markdown) else {
+                continue
+            }
+            let json = String(markdown[jsonRange])
+            if let comment = CommentCodec.decode(json: json) {
+                comments.append(comment)
+            }
+        }
+
+        return comments.sorted { $0.numericID < $1.numericID }
+    }
+
+    private func nextCommentID(from comments: [MarkdownComment]) -> String {
+        let maxID = comments.map(\.numericID).max() ?? 0
+        return "COM-\(maxID + 1)"
+    }
+
+    private func ensureCommentHeader(in markdown: String, insertionOffset: Int) -> (markdown: String, insertedBytes: Int, insertionOffset: Int) {
+        if markdown.contains(commentHeaderPrefix) {
+            return (markdown, 0, insertionOffset)
+        }
+        let header = commentHeaderLine + "\n\n"
+        guard let insertIndex = indexForUTF8Offset(insertionOffset, in: markdown) else {
+            return (markdown, 0, insertionOffset)
+        }
+        let updated = String(markdown[..<insertIndex]) + header + String(markdown[insertIndex...])
+        return (updated, header.utf8.count, insertionOffset)
+    }
+
+    private func insertCommentMarkers(in markdown: String, startOffset: Int, endOffset: Int, comment: MarkdownComment) -> String? {
+        guard let startIndex = indexForUTF8Offset(startOffset, in: markdown),
+              let endIndex = indexForUTF8Offset(endOffset, in: markdown),
+              startIndex <= endIndex,
+              let payload = CommentCodec.encode(comment: comment) else {
+            return nil
+        }
+        let startMarker = "<!-- MV-COMMENT-START \(payload) -->"
+        let endMarker = "<!-- MV-COMMENT-END \(comment.id) -->"
+        let before = markdown[..<startIndex]
+        let middle = markdown[startIndex..<endIndex]
+        let after = markdown[endIndex...]
+        return String(before) + startMarker + String(middle) + endMarker + String(after)
+    }
+
+    private func updatingCommentPayload(in markdown: String, id: String, body: String) -> String? {
+        let pattern = "<!--\\s*MV-COMMENT-START\\s+({.*?})\\s*-->"
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else {
+            return nil
+        }
+        let range = NSRange(markdown.startIndex..<markdown.endIndex, in: markdown)
+        let matches = regex.matches(in: markdown, options: [], range: range)
+        let mutable = NSMutableString(string: markdown)
+
+        for match in matches.reversed() {
+            guard match.numberOfRanges > 1 else { continue }
+            let jsonRange = match.range(at: 1)
+            let json = (markdown as NSString).substring(with: jsonRange)
+            guard let existing = CommentCodec.decode(json: json), existing.id == id else {
+                continue
+            }
+            let updated = MarkdownComment(id: existing.id, created: existing.created, updated: Date(), body: body)
+            guard let payload = CommentCodec.encode(comment: updated) else { continue }
+            let replacement = "<!-- MV-COMMENT-START \(payload) -->"
+            mutable.replaceCharacters(in: match.range, with: replacement)
+            return mutable as String
+        }
+        return nil
+    }
+
+    private func removingCommentMarkers(in markdown: String, id: String) -> String? {
+        let startPattern = "<!--\\s*MV-COMMENT-START\\s+({.*?})\\s*-->"
+        guard let startRegex = try? NSRegularExpression(pattern: startPattern, options: [.dotMatchesLineSeparators]) else {
+            return nil
+        }
+        let range = NSRange(markdown.startIndex..<markdown.endIndex, in: markdown)
+        let matches = startRegex.matches(in: markdown, options: [], range: range)
+        let mutable = NSMutableString(string: markdown)
+        var removed = false
+
+        for match in matches.reversed() {
+            guard match.numberOfRanges > 1 else { continue }
+            let jsonRange = match.range(at: 1)
+            let json = (markdown as NSString).substring(with: jsonRange)
+            guard let existing = CommentCodec.decode(json: json), existing.id == id else {
+                continue
+            }
+            mutable.replaceCharacters(in: match.range, with: "")
+            removed = true
+            break
+        }
+
+        guard removed else { return nil }
+        let endPattern = "<!--\\s*MV-COMMENT-END\\s+\(NSRegularExpression.escapedPattern(for: id))\\s*-->"
+        guard let endRegex = try? NSRegularExpression(pattern: endPattern, options: []) else {
+            return mutable as String
+        }
+        let current = mutable as String
+        let endRange = NSRange(current.startIndex..<current.endIndex, in: current)
+        let result = endRegex.stringByReplacingMatches(in: current, options: [], range: endRange, withTemplate: "")
+        return result
+    }
+
+    private func indexForUTF8Offset(_ offset: Int, in string: String) -> String.Index? {
+        guard offset >= 0 else { return nil }
+        let utf8 = string.utf8
+        guard offset <= utf8.count else { return nil }
+        let utf8Index = utf8.index(utf8.startIndex, offsetBy: offset)
+        return utf8Index.samePosition(in: string)
     }
 
     func reload() {
@@ -838,6 +1060,44 @@ class DocumentState: ObservableObject {
                     color: var(--color-fg-default);
                     font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
                 }
+                .mv-comment-highlight {
+                    background-color: rgba(255, 230, 153, 0.6);
+                    border-radius: 4px;
+                    padding: 0 2px;
+                    cursor: pointer;
+                    box-decoration-break: clone;
+                    -webkit-box-decoration-break: clone;
+                }
+                .mv-comment-highlight:hover {
+                    background-color: rgba(255, 214, 102, 0.7);
+                }
+                #mv-comment-action {
+                    position: fixed;
+                    z-index: 9999;
+                    padding: 6px 10px;
+                    border-radius: 999px;
+                    border: 1px solid var(--color-border-default);
+                    background-color: var(--color-canvas-default);
+                    color: var(--color-fg-default);
+                    font-size: 12px;
+                    font-weight: 600;
+                    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.12);
+                    display: none;
+                    cursor: pointer;
+                    user-select: none;
+                }
+                #mv-comment-action:hover {
+                    border-color: var(--color-accent-fg);
+                    color: var(--color-accent-fg);
+                }
+                @media (prefers-color-scheme: dark) {
+                    .mv-comment-highlight {
+                        background-color: rgba(255, 205, 87, 0.25);
+                    }
+                    .mv-comment-highlight:hover {
+                        background-color: rgba(255, 205, 87, 0.4);
+                    }
+                }
                 mark.mv-find-match {
                     background-color: #fff3b0;
                     color: #111111;
@@ -849,7 +1109,9 @@ class DocumentState: ObservableObject {
             </style>
         </head>
         <body>
-            \(body)
+            <div id="mv-document">
+                \(body)
+            </div>
             <script>hljs.highlightAll();</script>
             <script>
                 (function() {
@@ -876,8 +1138,9 @@ class DocumentState: ObservableObject {
 
                     function collectTextNodes() {
                         var nodes = [];
+                        var root = document.getElementById("mv-document") || document.body;
                         var walker = document.createTreeWalker(
-                            document.body,
+                            root,
                             NodeFilter.SHOW_TEXT,
                             {
                                 acceptNode: function(node) {
@@ -988,6 +1251,252 @@ class DocumentState: ObservableObject {
                         }
                     };
                 })();
+                (function() {
+                    function utf8Length(text) {
+                        return new TextEncoder().encode(text).length;
+                    }
+
+                    function findTextSpan(node) {
+                        if (!node) {
+                            return null;
+                        }
+                        if (node.nodeType === Node.TEXT_NODE) {
+                            if (!node.parentElement) {
+                                return null;
+                            }
+                            return node.parentElement.closest("[data-mv-text-start]");
+                        }
+                        if (node.nodeType === Node.ELEMENT_NODE) {
+                            return node.closest("[data-mv-text-start]");
+                        }
+                        return null;
+                    }
+
+                    function isDisallowedSelection(node) {
+                        if (!node || !node.parentElement) {
+                            return false;
+                        }
+                        return Boolean(node.parentElement.closest("code, pre, a, [data-mv-frontmatter]"));
+                    }
+
+                    var lastSelectionInfo = null;
+                    var commentAction = null;
+
+                    function ensureCommentAction() {
+                        if (commentAction) {
+                            return commentAction;
+                        }
+                        commentAction = document.createElement("button");
+                        commentAction.id = "mv-comment-action";
+                        commentAction.type = "button";
+                        commentAction.textContent = "Comment";
+                        commentAction.addEventListener("mousedown", function(event) {
+                            event.preventDefault();
+                        });
+                        commentAction.addEventListener("click", function(event) {
+                            event.stopPropagation();
+                            if (!lastSelectionInfo) {
+                                hideCommentAction();
+                                return;
+                            }
+                            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.commentSelection) {
+                                window.webkit.messageHandlers.commentSelection.postMessage(lastSelectionInfo);
+                            }
+                            hideCommentAction();
+                        });
+                        document.body.appendChild(commentAction);
+                        return commentAction;
+                    }
+
+                    function showCommentAction(rect) {
+                        var action = ensureCommentAction();
+                        var width = action.offsetWidth || 90;
+                        var height = action.offsetHeight || 28;
+                        var x = rect.x + rect.width + 8;
+                        var y = rect.y - 4;
+                        x = Math.min(x, window.innerWidth - width - 8);
+                        y = Math.min(y, window.innerHeight - height - 8);
+                        x = Math.max(8, x);
+                        y = Math.max(8, y);
+                        action.style.left = x + "px";
+                        action.style.top = y + "px";
+                        action.style.display = "block";
+                    }
+
+                    function hideCommentAction() {
+                        if (commentAction) {
+                            commentAction.style.display = "none";
+                        }
+                    }
+
+                    function updateCommentAction() {
+                        var info = getSelectionInfo();
+                        if (info && !info.error) {
+                            lastSelectionInfo = info;
+                            showCommentAction(info.rect);
+                        } else {
+                            lastSelectionInfo = null;
+                            hideCommentAction();
+                        }
+                    }
+
+                    function getSelectionInfo() {
+                        var selection = window.getSelection();
+                        if (!selection || selection.rangeCount === 0) {
+                            return { error: "Select text to add a comment." };
+                        }
+                        var range = selection.getRangeAt(0);
+                        if (range.collapsed) {
+                            return { error: "Select text to add a comment." };
+                        }
+                        if (isDisallowedSelection(range.startContainer) || isDisallowedSelection(range.endContainer)) {
+                            return { error: "Comments aren't supported inside code, links, or front matter." };
+                        }
+                        var startSpan = findTextSpan(range.startContainer);
+                        var endSpan = findTextSpan(range.endContainer);
+                        if (!startSpan || !endSpan) {
+                            return { error: "Selection must be inside the document body." };
+                        }
+                        var startBase = parseInt(startSpan.dataset.mvTextStart || "0", 10);
+                        var endBase = parseInt(endSpan.dataset.mvTextStart || "0", 10);
+                        var startText = range.startContainer.nodeType === Node.TEXT_NODE ? (range.startContainer.nodeValue || "") : "";
+                        var endText = range.endContainer.nodeType === Node.TEXT_NODE ? (range.endContainer.nodeValue || "") : "";
+                        var startOffset = startBase + utf8Length(startText.slice(0, range.startOffset));
+                        var endOffset = endBase + utf8Length(endText.slice(0, range.endOffset));
+                        if (!Number.isFinite(startOffset) || !Number.isFinite(endOffset) || endOffset <= startOffset) {
+                            return { error: "Selection isn't valid for comments." };
+                        }
+                        var rect = range.getBoundingClientRect();
+                        return {
+                            start: startOffset,
+                            end: endOffset,
+                            text: selection.toString(),
+                            rect: {
+                                x: rect.x,
+                                y: rect.y,
+                                width: rect.width,
+                                height: rect.height
+                            }
+                        };
+                    }
+
+                    function clearCommentHighlights() {
+                        var highlights = document.querySelectorAll("span.mv-comment-highlight");
+                        for (var i = highlights.length - 1; i >= 0; i--) {
+                            var highlight = highlights[i];
+                            var parent = highlight.parentNode;
+                            if (!parent) {
+                                continue;
+                            }
+                            while (highlight.firstChild) {
+                                parent.insertBefore(highlight.firstChild, highlight);
+                            }
+                            parent.removeChild(highlight);
+                            parent.normalize();
+                        }
+                    }
+
+                    function applyCommentHighlights() {
+                        clearCommentHighlights();
+                        var root = document.getElementById("mv-document") || document.body;
+                        if (!root) {
+                            return;
+                        }
+                        var walker = document.createTreeWalker(root, NodeFilter.SHOW_COMMENT, null, false);
+                        var starts = {};
+                        var ends = {};
+                        var payloads = {};
+                        var node;
+                        while ((node = walker.nextNode())) {
+                            var text = (node.nodeValue || "").trim();
+                            if (text.indexOf("MV-COMMENT-START") === 0) {
+                                var jsonText = text.slice("MV-COMMENT-START".length).trim();
+                                try {
+                                    var payload = JSON.parse(jsonText);
+                                    if (payload && payload.id) {
+                                        starts[payload.id] = node;
+                                        payloads[payload.id] = jsonText;
+                                    }
+                                } catch (e) {
+                                }
+                            } else if (text.indexOf("MV-COMMENT-END") === 0) {
+                                var id = text.slice("MV-COMMENT-END".length).trim();
+                                if (id) {
+                                    ends[id] = node;
+                                }
+                            }
+                        }
+
+                        Object.keys(starts).forEach(function(id) {
+                            var startNode = starts[id];
+                            var endNode = ends[id];
+                            if (!startNode || !endNode) {
+                                return;
+                            }
+                            var range = document.createRange();
+                            range.setStartAfter(startNode);
+                            range.setEndBefore(endNode);
+                            var wrapper = document.createElement("span");
+                            wrapper.className = "mv-comment-highlight";
+                            wrapper.dataset.commentId = id;
+                            if (payloads[id]) {
+                                wrapper.dataset.commentPayload = payloads[id];
+                            }
+                            var fragment = range.extractContents();
+                            wrapper.appendChild(fragment);
+                            range.insertNode(wrapper);
+                        });
+                    }
+
+                    function sendCommentTapped(target) {
+                        if (!target) {
+                            return;
+                        }
+                        var rect = target.getBoundingClientRect();
+                        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.commentTapped) {
+                            window.webkit.messageHandlers.commentTapped.postMessage({
+                                id: target.dataset.commentId || "",
+                                payload: target.dataset.commentPayload || "",
+                                rect: {
+                                    x: rect.x,
+                                    y: rect.y,
+                                    width: rect.width,
+                                    height: rect.height
+                                }
+                            });
+                        }
+                    }
+
+                    document.addEventListener("click", function(event) {
+                        var target = event.target;
+                        if (!target) {
+                            return;
+                        }
+                        var highlight = target.closest(".mv-comment-highlight");
+                        if (highlight) {
+                            sendCommentTapped(highlight);
+                        }
+                    });
+
+                    document.addEventListener("selectionchange", function() {
+                        updateCommentAction();
+                    });
+
+                    window.addEventListener("scroll", function() {
+                        hideCommentAction();
+                    }, true);
+
+                    window.addEventListener("resize", function() {
+                        hideCommentAction();
+                    });
+
+                    window.__markdownViewerComments = {
+                        getSelection: getSelectionInfo,
+                        refresh: applyCommentHighlights
+                    };
+
+                    applyCommentHighlights();
+                })();
             </script>
         </body>
         </html>
@@ -1002,9 +1511,90 @@ struct OutlineItem: Identifiable {
     let anchorID: String
 }
 
+struct FrontMatterInfo {
+    let items: [(String, String)]
+    let content: String
+    let contentStartOffset: Int
+    let frontMatterEndOffset: Int
+}
+
+struct MarkdownComment: Identifiable, Equatable {
+    let id: String
+    let created: Date
+    let updated: Date
+    let body: String
+
+    var numericID: Int {
+        let parts = id.split(separator: "-")
+        if parts.count == 2, let number = Int(parts[1]) {
+            return number
+        }
+        return 0
+    }
+}
+
+struct CommentPayload: Codable {
+    let id: String
+    let created: String
+    let updated: String
+    let bodyB64: String
+}
+
+enum CommentCodec {
+    static func encode(comment: MarkdownComment) -> String? {
+        let formatter = ISO8601DateFormatter()
+        let payload = CommentPayload(
+            id: comment.id,
+            created: formatter.string(from: comment.created),
+            updated: formatter.string(from: comment.updated),
+            bodyB64: Data(comment.body.utf8).base64EncodedString()
+        )
+        guard let data = try? JSONEncoder().encode(payload) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func decode(json: String) -> MarkdownComment? {
+        guard let data = json.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(CommentPayload.self, from: data) else {
+            return nil
+        }
+        let formatter = ISO8601DateFormatter()
+        guard let created = formatter.date(from: payload.created),
+              let updated = formatter.date(from: payload.updated),
+              let bodyData = Data(base64Encoded: payload.bodyB64),
+              let body = String(data: bodyData, encoding: .utf8) else {
+            return nil
+        }
+        return MarkdownComment(id: payload.id, created: created, updated: updated, body: body)
+    }
+}
+
 struct RenderedMarkdown {
     let html: String
     let outline: [OutlineItem]
+}
+
+struct SourceMapper {
+    private let lineStartOffsets: [Int]
+
+    init(source: String) {
+        var offsets: [Int] = [0]
+        var index = 0
+        for byte in source.utf8 {
+            if byte == 10 {
+                offsets.append(index + 1)
+            }
+            index += 1
+        }
+        self.lineStartOffsets = offsets
+    }
+
+    func offset(for location: SourceLocation) -> Int? {
+        guard location.line > 0, location.line <= lineStartOffsets.count else { return nil }
+        let lineStart = lineStartOffsets[location.line - 1]
+        let columnOffset = max(0, location.column - 1)
+        return lineStart + columnOffset
+    }
 }
 
 struct HeadingSlugger {
@@ -1053,6 +1643,18 @@ struct MarkdownRenderer: MarkupWalker {
     var result = ""
     var outline: [OutlineItem] = []
     var slugger = HeadingSlugger()
+    private let sourceMapper: SourceMapper?
+    private let sourceOffsetBase: Int
+
+    init(source: String, sourceOffsetBase: Int) {
+        self.sourceMapper = SourceMapper(source: source)
+        self.sourceOffsetBase = sourceOffsetBase
+    }
+
+    init() {
+        self.sourceMapper = nil
+        self.sourceOffsetBase = 0
+    }
 
     mutating func render(_ document: Document) -> RenderedMarkdown {
         result = ""
@@ -1080,7 +1682,7 @@ struct MarkdownRenderer: MarkupWalker {
             for child in paragraph.children { visit(child) }
             result += "</p>\n"
         case let text as Markdown.Text:
-            result += escapeHTML(text.string)
+            appendText(text)
         case let emphasis as Emphasis:
             result += "<em>"
             for child in emphasis.children { visit(child) }
@@ -1148,11 +1750,39 @@ struct MarkdownRenderer: MarkupWalker {
             result += "<del>"
             for child in strikethrough.children { visit(child) }
             result += "</del>"
+        case let htmlBlock as HTMLBlock:
+            if shouldRenderHTML(htmlBlock.rawHTML) {
+                result += htmlBlock.rawHTML
+            }
+        case let inlineHTML as InlineHTML:
+            if shouldRenderHTML(inlineHTML.rawHTML) {
+                result += inlineHTML.rawHTML
+            }
         default:
             for child in markup.children {
                 visit(child)
             }
         }
+    }
+
+    private mutating func appendText(_ text: Markdown.Text) {
+        let escaped = escapeHTML(text.string)
+        guard let range = text.range,
+              let mapper = sourceMapper,
+              let start = mapper.offset(for: range.lowerBound),
+              let end = mapper.offset(for: range.upperBound) else {
+            result += escaped
+            return
+        }
+        let startOffset = start + sourceOffsetBase
+        let endOffset = end + sourceOffsetBase
+        result += "<span data-mv-text-start=\"\(startOffset)\" data-mv-text-end=\"\(endOffset)\">"
+        result += escaped
+        result += "</span>"
+    }
+
+    private func shouldRenderHTML(_ html: String) -> Bool {
+        html.contains("MV-COMMENT-") || html.contains(commentHeaderPrefix)
     }
 
     private func escapeHTML(_ string: String) -> String {
@@ -1197,12 +1827,20 @@ struct ContentView: View {
     @State private var isHoveringSidebar = false
     @State private var isOutlinePinned = false
     @State private var scrollRequest: ScrollRequest?
+    @State private var commentPopover: CommentPopoverState?
+    @State private var commentSelectionRequest: UUID?
+    @State private var commentError: String?
+    @State private var commentErrorTask: DispatchWorkItem?
 
     init(documentState: DocumentState = DocumentState()) {
         _documentState = StateObject(wrappedValue: documentState)
     }
 
     private var canShowOutline: Bool {
+        !documentState.htmlContent.isEmpty
+    }
+
+    private var canShowComments: Bool {
         !documentState.htmlContent.isEmpty
     }
 
@@ -1228,7 +1866,38 @@ struct ContentView: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
-                    WebView(htmlContent: documentState.htmlContent, scrollRequest: scrollRequest, reloadToken: documentState.reloadToken, zoomLevel: documentState.zoomLevel, findRequest: documentState.findRequest)
+                    WebView(
+                        htmlContent: documentState.htmlContent,
+                        scrollRequest: scrollRequest,
+                        reloadToken: documentState.reloadToken,
+                        zoomLevel: documentState.zoomLevel,
+                        findRequest: documentState.findRequest,
+                        commentSelectionRequest: commentSelectionRequest,
+                        commentPopover: commentPopover,
+                        onCommentSelection: { selection in
+                            commentPopover = CommentPopoverState(token: UUID(), anchorRect: selection.rect, mode: .add(selection))
+                        },
+                        onCommentSelectionError: { message in
+                            showCommentError(message)
+                        },
+                        onCommentTapped: { id, rect, payloadComment in
+                            let comment = payloadComment ?? documentState.comments.first(where: { $0.id == id })
+                            guard let comment else { return }
+                            commentPopover = CommentPopoverState(token: UUID(), anchorRect: rect, mode: .edit(comment))
+                        },
+                        onAddComment: { selection, body in
+                            documentState.addComment(startOffset: selection.start, endOffset: selection.end, body: body)
+                        },
+                        onUpdateComment: { id, body in
+                            documentState.updateComment(id: id, body: body)
+                        },
+                        onDeleteComment: { id in
+                            documentState.deleteComment(id: id)
+                        },
+                        onDismissCommentPopover: {
+                            commentPopover = nil
+                        }
+                    )
                 }
             }
 
@@ -1246,6 +1915,7 @@ struct ContentView: View {
             if documentState.isShowingFindBar {
                 documentState.updateFindResults()
             }
+            commentPopover = nil
         }
         .onExitCommand {
             if documentState.isShowingFindBar {
@@ -1273,8 +1943,17 @@ struct ContentView: View {
             }
         }
         .overlay(alignment: .topTrailing) {
-            if documentState.fileChanged || documentState.isShowingFindBar {
+            if documentState.fileChanged || documentState.isShowingFindBar || commentError != nil {
                 VStack(alignment: .trailing, spacing: 8) {
+                    if let commentError {
+                        Text(commentError)
+                            .font(.system(size: 11, weight: .medium))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Color.red.opacity(0.9))
+                            .foregroundColor(.white)
+                            .cornerRadius(6)
+                    }
                     if documentState.fileChanged {
                         Button(action: {
                             documentState.reload()
@@ -1308,6 +1987,19 @@ struct ContentView: View {
             }
         }
         .toolbar {
+            if canShowComments {
+                ToolbarItem(placement: .primaryAction) {
+                    Button(action: {
+                        requestCommentSelection()
+                    }) {
+                        Label("Add Comment", systemImage: "text.bubble")
+                            .labelStyle(.iconOnly)
+                            .font(.system(size: 13, weight: .semibold))
+                    }
+                    .help("Add Comment")
+                    .keyboardShortcut("m", modifiers: [.command, .shift])
+                }
+            }
             if canShowOutline {
                 ToolbarItem(placement: .primaryAction) {
                     Button(action: {
@@ -1325,6 +2017,20 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    private func requestCommentSelection() {
+        commentSelectionRequest = UUID()
+    }
+
+    private func showCommentError(_ message: String) {
+        commentError = message
+        commentErrorTask?.cancel()
+        let task = DispatchWorkItem {
+            commentError = nil
+        }
+        commentErrorTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: task)
     }
 }
 
@@ -1455,6 +2161,123 @@ struct FindBar: View {
     }
 }
 
+struct CommentEditorView: View {
+    let mode: CommentPopoverMode
+    let onSave: (String) -> Void
+    let onDelete: (() -> Void)?
+    let onCancel: () -> Void
+    @State private var commentText: String
+
+    init(mode: CommentPopoverMode, onSave: @escaping (String) -> Void, onDelete: (() -> Void)?, onCancel: @escaping () -> Void) {
+        self.mode = mode
+        self.onSave = onSave
+        self.onDelete = onDelete
+        self.onCancel = onCancel
+        switch mode {
+        case .add(let selection):
+            _commentText = State(initialValue: "")
+            self.selectedText = selection.text
+            self.commentID = nil
+            self.createdAt = nil
+            self.updatedAt = nil
+        case .edit(let comment):
+            _commentText = State(initialValue: comment.body)
+            self.selectedText = nil
+            self.commentID = comment.id
+            self.createdAt = comment.created
+            self.updatedAt = comment.updated
+        }
+    }
+
+    private let selectedText: String?
+    private let commentID: String?
+    private let createdAt: Date?
+    private let updatedAt: Date?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(modeTitle)
+                    .font(.headline)
+                Spacer()
+                if let commentID {
+                    Button(action: {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(commentID, forType: .string)
+                    }) {
+                        HStack(spacing: 4) {
+                            Text(commentID)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Image(systemName: "doc.on.doc")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .help("Copy Comment ID")
+                }
+            }
+
+            if let selectedText, !selectedText.isEmpty {
+                Text(selectedText)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(3)
+            }
+
+            TextEditor(text: $commentText)
+                .font(.system(size: 12))
+                .frame(width: 280, height: 120)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color(NSColor.separatorColor))
+                )
+
+            if let createdAt, let updatedAt {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Created \(formatDate(createdAt))")
+                    Text("Edited \(formatDate(updatedAt))")
+                }
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            }
+
+            HStack {
+                Button("Cancel") {
+                    onCancel()
+                }
+                Spacer()
+                if let onDelete {
+                    Button("Delete") {
+                        onDelete()
+                    }
+                }
+                Button("Save") {
+                    onSave(commentText)
+                }
+            }
+        }
+        .padding(12)
+    }
+
+    private var modeTitle: String {
+        switch mode {
+        case .add:
+            return "Add Comment"
+        case .edit:
+            return "Comment"
+        }
+    }
+
+    private func formatDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+}
+
 struct ScrollRequest: Equatable {
     let id: String
     let token: UUID
@@ -1478,25 +2301,69 @@ struct FindPayload: Encodable {
     let reset: Bool
 }
 
+struct CommentSelection: Equatable {
+    let start: Int
+    let end: Int
+    let text: String
+    let rect: CGRect
+}
+
+struct CommentSelectionError: Error {
+    let message: String
+}
+
+enum CommentPopoverMode: Equatable {
+    case add(CommentSelection)
+    case edit(MarkdownComment)
+}
+
+struct CommentPopoverState: Equatable {
+    let token: UUID
+    let anchorRect: CGRect
+    let mode: CommentPopoverMode
+}
+
 struct WebView: NSViewRepresentable {
     let htmlContent: String
     let scrollRequest: ScrollRequest?
     let reloadToken: UUID?
     let zoomLevel: CGFloat
     let findRequest: FindRequest?
+    let commentSelectionRequest: UUID?
+    let commentPopover: CommentPopoverState?
+    let onCommentSelection: (CommentSelection) -> Void
+    let onCommentSelectionError: (String) -> Void
+    let onCommentTapped: (String, CGRect, MarkdownComment?) -> Void
+    let onAddComment: (CommentSelection, String) -> Void
+    let onUpdateComment: (String, String) -> Void
+    let onDeleteComment: (String) -> Void
+    let onDismissCommentPopover: () -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
     }
 
     func makeNSView(context: Context) -> WKWebView {
-        let webView = WKWebView()
+        let config = WKWebViewConfiguration()
+        let userContentController = WKUserContentController()
+        userContentController.add(context.coordinator, name: "commentTapped")
+        userContentController.add(context.coordinator, name: "commentSelection")
+        config.userContentController = userContentController
+        let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")
         return webView
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
+        context.coordinator.onCommentSelection = onCommentSelection
+        context.coordinator.onCommentSelectionError = onCommentSelectionError
+        context.coordinator.onCommentTapped = onCommentTapped
+        context.coordinator.onAddComment = onAddComment
+        context.coordinator.onUpdateComment = onUpdateComment
+        context.coordinator.onDeleteComment = onDeleteComment
+        context.coordinator.onDismissCommentPopover = onDismissCommentPopover
+
         if htmlContent != context.coordinator.lastHTML {
             let shouldPreserveScroll = reloadToken != nil && reloadToken != context.coordinator.lastReloadToken
             context.coordinator.lastReloadToken = reloadToken
@@ -1527,9 +2394,21 @@ struct WebView: NSViewRepresentable {
         if let request = findRequest {
             context.coordinator.requestFind(request, in: webView)
         }
+
+        if let request = commentSelectionRequest,
+           request != context.coordinator.lastCommentSelectionRequest {
+            context.coordinator.lastCommentSelectionRequest = request
+            context.coordinator.requestCommentSelection(in: webView)
+        }
+
+        if let popover = commentPopover {
+            context.coordinator.showCommentPopover(popover, in: webView)
+        } else {
+            context.coordinator.closeCommentPopover()
+        }
     }
 
-    class Coordinator: NSObject, WKNavigationDelegate {
+    class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler, NSPopoverDelegate {
         var lastHTML: String?
         var pendingAnchor: String?
         var pendingToken: UUID?
@@ -1540,6 +2419,16 @@ struct WebView: NSViewRepresentable {
         var lastZoomLevel: CGFloat = 1.0
         var pendingFindRequest: FindRequest?
         var lastFindToken: UUID?
+        var lastCommentSelectionRequest: UUID?
+        var commentPopover: NSPopover?
+        var lastPopoverToken: UUID?
+        var onCommentSelection: ((CommentSelection) -> Void)?
+        var onCommentSelectionError: ((String) -> Void)?
+        var onCommentTapped: ((String, CGRect, MarkdownComment?) -> Void)?
+        var onAddComment: ((CommentSelection, String) -> Void)?
+        var onUpdateComment: ((String, String) -> Void)?
+        var onDeleteComment: ((String) -> Void)?
+        var onDismissCommentPopover: (() -> Void)?
 
         func requestScroll(_ request: ScrollRequest, in webView: WKWebView) {
             guard request.token != lastHandledToken else { return }
@@ -1607,6 +2496,140 @@ struct WebView: NSViewRepresentable {
                 return
             }
             webView.evaluateJavaScript("window.__markdownViewerFind(\(json));", completionHandler: nil)
+        }
+
+        func requestCommentSelection(in webView: WKWebView) {
+            let script = "window.__markdownViewerComments && window.__markdownViewerComments.getSelection ? window.__markdownViewerComments.getSelection() : null"
+            webView.evaluateJavaScript(script) { [weak self] result, error in
+                guard let self else { return }
+                if let error {
+                    self.onCommentSelectionError?(error.localizedDescription)
+                    return
+                }
+                switch self.parseCommentSelection(result) {
+                case .success(let selection):
+                    self.onCommentSelection?(selection)
+                case .failure(let error):
+                    self.onCommentSelectionError?(error.message)
+                }
+            }
+        }
+
+        func showCommentPopover(_ state: CommentPopoverState, in webView: WKWebView) {
+            if lastPopoverToken == state.token, commentPopover?.isShown == true {
+                return
+            }
+            closeCommentPopover()
+
+            let deleteHandler: (() -> Void)?
+            switch state.mode {
+            case .add:
+                deleteHandler = nil
+            case .edit(let comment):
+                deleteHandler = { [weak self] in
+                    self?.onDeleteComment?(comment.id)
+                    self?.onDismissCommentPopover?()
+                }
+            }
+
+            let popover = NSPopover()
+            popover.behavior = .transient
+            popover.delegate = self
+            let view = CommentEditorView(
+                mode: state.mode,
+                onSave: { [weak self] text in
+                    guard let self else { return }
+                    switch state.mode {
+                    case .add(let selection):
+                        self.onAddComment?(selection, text)
+                    case .edit(let comment):
+                        self.onUpdateComment?(comment.id, text)
+                    }
+                    self.onDismissCommentPopover?()
+                },
+                onDelete: deleteHandler,
+                onCancel: { [weak self] in
+                    self?.onDismissCommentPopover?()
+                }
+            )
+            popover.contentViewController = NSHostingController(rootView: view)
+            let rect = popoverAnchorRect(state.anchorRect, in: webView)
+            popover.show(relativeTo: rect, of: webView, preferredEdge: .maxY)
+            commentPopover = popover
+            lastPopoverToken = state.token
+        }
+
+        func closeCommentPopover() {
+            if commentPopover?.isShown == true {
+                commentPopover?.close()
+            }
+            commentPopover = nil
+            lastPopoverToken = nil
+        }
+
+        func popoverDidClose(_ notification: Notification) {
+            onDismissCommentPopover?()
+            commentPopover = nil
+            lastPopoverToken = nil
+        }
+
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            switch message.name {
+            case "commentTapped":
+                guard let body = message.body as? [String: Any],
+                      let id = body["id"] as? String,
+                      let payload = body["payload"] as? String,
+                      let rectDict = body["rect"] as? [String: Any],
+                      let rect = parseRect(rectDict) else {
+                    return
+                }
+                let decoded = payload.isEmpty ? nil : CommentCodec.decode(json: payload)
+                onCommentTapped?(id, rect, decoded)
+            case "commentSelection":
+                switch parseCommentSelection(message.body) {
+                case .success(let selection):
+                    onCommentSelection?(selection)
+                case .failure(let error):
+                    onCommentSelectionError?(error.message)
+                }
+            default:
+                return
+            }
+        }
+
+        private func parseCommentSelection(_ result: Any?) -> Result<CommentSelection, CommentSelectionError> {
+            guard let dict = result as? [String: Any] else {
+                return .failure(CommentSelectionError(message: "Select text to add a comment."))
+            }
+            if let error = dict["error"] as? String, !error.isEmpty {
+                return .failure(CommentSelectionError(message: error))
+            }
+            guard let start = dict["start"] as? Double,
+                  let end = dict["end"] as? Double,
+                  let text = dict["text"] as? String,
+                  let rectDict = dict["rect"] as? [String: Any],
+                  let rect = parseRect(rectDict) else {
+                return .failure(CommentSelectionError(message: "Selection isn't valid for comments."))
+            }
+            return .success(CommentSelection(start: Int(start), end: Int(end), text: text, rect: rect))
+        }
+
+        private func parseRect(_ dict: [String: Any]) -> CGRect? {
+            guard let x = dict["x"] as? Double,
+                  let y = dict["y"] as? Double,
+                  let width = dict["width"] as? Double,
+                  let height = dict["height"] as? Double else {
+                return nil
+            }
+            return CGRect(x: x, y: y, width: width, height: height)
+        }
+
+        private func popoverAnchorRect(_ rect: CGRect, in webView: WKWebView) -> CGRect {
+            let height = webView.bounds.height
+            let adjustedHeight = max(rect.height, 1)
+            let adjustedWidth = max(rect.width, 1)
+            let y = height - rect.maxY
+            return CGRect(x: rect.minX, y: y, width: adjustedWidth, height: adjustedHeight)
         }
     }
 }
