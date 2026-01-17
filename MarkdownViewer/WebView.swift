@@ -14,13 +14,18 @@ struct WebView: NSViewRepresentable {
     let reloadToken: UUID?
     let zoomLevel: CGFloat
     let findRequest: FindRequest?
+    let onActiveAnchorChange: ((String?) -> Void)?
 
     func makeCoordinator() -> Coordinator {
-        Coordinator()
+        Coordinator(onActiveAnchorChange: onActiveAnchorChange)
     }
 
     func makeNSView(context: Context) -> WKWebView {
-        let webView = WKWebView()
+        let contentController = WKUserContentController()
+        contentController.add(context.coordinator, name: "outlinePosition")
+        let config = WKWebViewConfiguration()
+        config.userContentController = contentController
+        let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")
         return webView
@@ -33,6 +38,7 @@ struct WebView: NSViewRepresentable {
             context.coordinator.lastReloadToken = reloadToken
             context.coordinator.lastHTML = htmlContent
             context.coordinator.isLoading = true
+            context.coordinator.lastActiveAnchorID = nil
 
             if shouldPreserveScroll {
                 let coordinator = context.coordinator
@@ -60,7 +66,7 @@ struct WebView: NSViewRepresentable {
         }
     }
 
-    class Coordinator: NSObject, WKNavigationDelegate {
+    class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         var lastHTML: String?
         var pendingAnchor: String?
         var pendingToken: UUID?
@@ -71,6 +77,12 @@ struct WebView: NSViewRepresentable {
         var lastZoomLevel: CGFloat = 1.0
         var pendingFindRequest: FindRequest?
         var lastFindToken: UUID?
+        var lastActiveAnchorID: String?
+        private let onActiveAnchorChange: ((String?) -> Void)?
+
+        init(onActiveAnchorChange: ((String?) -> Void)?) {
+            self.onActiveAnchorChange = onActiveAnchorChange
+        }
 
         func requestScroll(_ request: ScrollRequest, in webView: WKWebView) {
             guard request.token != lastHandledToken else { return }
@@ -138,6 +150,24 @@ struct WebView: NSViewRepresentable {
                 return
             }
             webView.evaluateJavaScript("window.__markdownViewerFind(\(json));", completionHandler: nil)
+        }
+
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard message.name == "outlinePosition" else { return }
+            var anchorID: String?
+            if let body = message.body as? [String: Any] {
+                anchorID = body["id"] as? String
+            } else if let body = message.body as? String {
+                anchorID = body
+            }
+            if anchorID?.isEmpty == true {
+                anchorID = nil
+            }
+            guard anchorID != lastActiveAnchorID else { return }
+            lastActiveAnchorID = anchorID
+            DispatchQueue.main.async { [onActiveAnchorChange] in
+                onActiveAnchorChange?(anchorID)
+            }
         }
     }
 }

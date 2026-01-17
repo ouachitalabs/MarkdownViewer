@@ -52,12 +52,16 @@ struct MarkdownHTMLTemplate {
     private static func buildScriptBlocks() -> String {
         let highlight = safeScript(resourceString(name: "highlight.min", extension: "js"))
         let find = safeScript(resourceString(name: "find", extension: "js"))
+        let toc = safeScript(resourceString(name: "toc", extension: "js"))
         return """
         <script>
         \(highlight)
         </script>
         <script>
         \(find)
+        </script>
+        <script>
+        \(toc)
         </script>
         """
     }
