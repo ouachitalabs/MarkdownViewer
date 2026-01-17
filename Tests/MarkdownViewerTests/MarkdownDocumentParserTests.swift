@@ -30,6 +30,55 @@ final class MarkdownDocumentParserTests: XCTestCase {
         XCTAssertEqual(content, input)
     }
 
+    func testParseFrontMatterSkipsInvalidLines() {
+        let input = """
+        ---
+        title: Hello
+        : ignored
+        not-a-pair
+        ---
+        Content
+        """
+
+        let (frontMatter, content) = MarkdownDocumentParser.parseFrontMatter(input)
+
+        XCTAssertEqual(frontMatter.count, 1)
+        XCTAssertEqual(frontMatter.first?.0, "title")
+        XCTAssertEqual(frontMatter.first?.1, "Hello")
+        XCTAssertEqual(content, "Content")
+    }
+
+    func testParseFrontMatterWithoutClosingDelimiterKeepsOriginalContent() {
+        let input = """
+        ---
+        title: Hello
+        Content
+        """
+
+        let (frontMatter, content) = MarkdownDocumentParser.parseFrontMatter(input)
+
+        XCTAssertEqual(frontMatter.count, 1)
+        XCTAssertEqual(frontMatter.first?.0, "title")
+        XCTAssertEqual(frontMatter.first?.1, "Hello")
+        XCTAssertEqual(content, input)
+    }
+
+    func testParseFrontMatterAllowsColonsInValues() {
+        let input = """
+        ---
+        title: Hello: World
+        ---
+        Content
+        """
+
+        let (frontMatter, content) = MarkdownDocumentParser.parseFrontMatter(input)
+
+        XCTAssertEqual(frontMatter.count, 1)
+        XCTAssertEqual(frontMatter.first?.0, "title")
+        XCTAssertEqual(frontMatter.first?.1, "Hello: World")
+        XCTAssertEqual(content, "Content")
+    }
+
     func testNormalizedOutlineDropsSingleH1AndShiftsLevels() {
         let items = [
             OutlineItem(title: "Title", level: 1, anchorID: "title"),
