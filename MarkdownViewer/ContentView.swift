@@ -16,38 +16,50 @@ struct ContentView: View {
         !documentState.htmlContent.isEmpty
     }
 
-    private var showOutline: Bool {
-        guard canShowOutline else { return false }
-        return isOutlinePinned || isHoveringEdge || isHoveringSidebar
+    private var showPinnedOutline: Bool {
+        canShowOutline && isOutlinePinned
+    }
+
+    private var showFloatingOutline: Bool {
+        canShowOutline && !isOutlinePinned && (isHoveringEdge || isHoveringSidebar)
+    }
+
+    @ViewBuilder
+    private var documentView: some View {
+        if documentState.htmlContent.isEmpty {
+            VStack(spacing: 16) {
+                Image(systemName: "doc.text")
+                    .font(.system(size: 48))
+                    .foregroundColor(.secondary)
+                Text("Open a Markdown file")
+                    .font(.title2)
+                    .foregroundColor(.secondary)
+                Text("Use File > Open or press \u{2318}O")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            WebView(
+                htmlContent: documentState.htmlContent,
+                scrollRequest: scrollRequest,
+                reloadToken: documentState.reloadToken,
+                zoomLevel: documentState.zoomLevel,
+                findRequest: documentState.findRequest
+            )
+        }
     }
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
-            Group {
-                if documentState.htmlContent.isEmpty {
-                    VStack(spacing: 16) {
-                        Image(systemName: "doc.text")
-                            .font(.system(size: 48))
-                            .foregroundColor(.secondary)
-                        Text("Open a Markdown file")
-                            .font(.title2)
-                            .foregroundColor(.secondary)
-                        Text("Use File > Open or press \u{2318}O")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    WebView(
-                        htmlContent: documentState.htmlContent,
-                        scrollRequest: scrollRequest,
-                        reloadToken: documentState.reloadToken,
-                        zoomLevel: documentState.zoomLevel,
-                        findRequest: documentState.findRequest
-                    )
+        HStack(spacing: 0) {
+            documentView
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if showPinnedOutline {
+                OutlineSidebar(items: documentState.outlineItems) { item in
+                    scrollRequest = ScrollRequest(id: item.anchorID, token: UUID())
                 }
+                .transition(.move(edge: .trailing))
             }
-
         }
         .frame(minWidth: 600, minHeight: 400)
         .navigationTitle(documentState.title)
@@ -69,22 +81,24 @@ struct ContentView: View {
             }
         }
         .overlay(alignment: .trailing) {
-            ZStack(alignment: .trailing) {
-                Color.clear
-                    .frame(width: 12)
-                    .contentShape(Rectangle())
-                    .onHover { hovering in
-                        isHoveringEdge = hovering
-                    }
+            if canShowOutline && !isOutlinePinned {
+                ZStack(alignment: .trailing) {
+                    Color.clear
+                        .frame(width: 12)
+                        .contentShape(Rectangle())
+                        .onHover { hovering in
+                            isHoveringEdge = hovering
+                        }
 
-                if showOutline {
-                    OutlineSidebar(items: documentState.outlineItems) { item in
-                        scrollRequest = ScrollRequest(id: item.anchorID, token: UUID())
+                    if showFloatingOutline {
+                        OutlineSidebar(items: documentState.outlineItems) { item in
+                            scrollRequest = ScrollRequest(id: item.anchorID, token: UUID())
+                        }
+                        .onHover { hovering in
+                            isHoveringSidebar = hovering
+                        }
+                        .transition(.move(edge: .trailing))
                     }
-                    .onHover { hovering in
-                        isHoveringSidebar = hovering
-                    }
-                    .transition(.move(edge: .trailing))
                 }
             }
         }
