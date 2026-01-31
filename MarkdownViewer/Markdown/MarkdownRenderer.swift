@@ -59,11 +59,13 @@ struct MarkdownRenderer: MarkupWalker {
     var result = ""
     var outline: [OutlineItem] = []
     var slugger = HeadingSlugger()
+    var baseURL: URL?
 
-    mutating func render(_ document: Document) -> RenderedMarkdown {
+    mutating func render(_ document: Document, baseURL: URL? = nil) -> RenderedMarkdown {
         result = ""
         outline = []
         slugger = HeadingSlugger()
+        self.baseURL = baseURL
         for child in document.children {
             visit(child)
         }
@@ -106,7 +108,8 @@ struct MarkdownRenderer: MarkupWalker {
             result += "</a>"
         case let image as Markdown.Image:
             let alt = image.plainText
-            result += "<img src=\"\(image.source ?? "")\" alt=\"\(escapeHTML(alt))\">"
+            let src = resolveImageSource(image.source)
+            result += "<img src=\"\(src)\" alt=\"\(escapeHTML(alt))\">"
         case let list as UnorderedList:
             result += "<ul>\n"
             for child in list.children { visit(child) }
@@ -164,6 +167,29 @@ struct MarkdownRenderer: MarkupWalker {
                 visit(child)
             }
         }
+    }
+
+    private func resolveImageSource(_ source: String?) -> String {
+        guard let source = source, !source.isEmpty else { return "" }
+
+        // Keep web URLs and data URLs as-is
+        if source.hasPrefix("http://") || source.hasPrefix("https://") || source.hasPrefix("data:") {
+            return source
+        }
+
+        // Already a file:// URL - convert to localimage://
+        if source.hasPrefix("file://") {
+            let path = String(source.dropFirst(7))
+            return "localimage://\(path)"
+        }
+
+        // Resolve relative path against baseURL
+        if let baseURL = baseURL {
+            let resolved = baseURL.appendingPathComponent(source)
+            return "localimage://\(resolved.path)"
+        }
+
+        return source
     }
 
     private func escapeHTML(_ string: String) -> String {

@@ -25,14 +25,19 @@ struct WebView: NSViewRepresentable {
         contentController.add(context.coordinator, name: "outlinePosition")
         let config = WKWebViewConfiguration()
         config.userContentController = contentController
+        config.setURLSchemeHandler(LocalImageSchemeHandler(), forURLScheme: LocalImageSchemeHandler.scheme)
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")
         return webView
     }
 
-    func updateNSView(_ webView: WKWebView, context: Context) {
+    private func loadContent(_ htmlContent: String, in webView: WKWebView) {
         let baseURL = Bundle.module.resourceURL ?? Bundle.main.resourceURL
+        webView.loadHTMLString(htmlContent, baseURL: baseURL)
+    }
+
+    func updateNSView(_ webView: WKWebView, context: Context) {
         if htmlContent != context.coordinator.lastHTML {
             let shouldPreserveScroll = reloadToken != nil && reloadToken != context.coordinator.lastReloadToken
             context.coordinator.lastReloadToken = reloadToken
@@ -42,12 +47,13 @@ struct WebView: NSViewRepresentable {
 
             if shouldPreserveScroll {
                 let coordinator = context.coordinator
-                webView.evaluateJavaScript("window.scrollY") { result, _ in
+                webView.evaluateJavaScript("window.scrollY") { [weak webView] result, _ in
+                    guard let webView = webView else { return }
                     coordinator.savedScrollY = (result as? CGFloat) ?? 0
-                    webView.loadHTMLString(htmlContent, baseURL: baseURL)
+                    self.loadContent(htmlContent, in: webView)
                 }
             } else {
-                webView.loadHTMLString(htmlContent, baseURL: baseURL)
+                loadContent(htmlContent, in: webView)
             }
         }
 

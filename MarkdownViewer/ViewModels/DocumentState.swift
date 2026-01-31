@@ -37,7 +37,7 @@ class DocumentState: ObservableObject {
             let (frontMatter, content) = MarkdownDocumentParser.parseFrontMatter(markdown)
             let document = Document(parsing: content)
             var renderer = MarkdownRenderer()
-            let rendered = renderer.render(document)
+            let rendered = renderer.render(document, baseURL: url.deletingLastPathComponent())
             let frontMatterHTML = renderFrontMatter(frontMatter)
             htmlContent = wrapInHTML(frontMatterHTML + rendered.html, title: url.lastPathComponent)
             title = url.lastPathComponent
