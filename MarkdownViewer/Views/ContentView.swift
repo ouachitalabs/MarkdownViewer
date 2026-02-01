@@ -3,14 +3,21 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var documentState: DocumentState
+    @ObservedObject private var recentFilesStore = RecentFilesStore.shared
+    @ObservedObject var appDelegate: AppDelegate
     @State private var isHoveringEdge = false
     @State private var isHoveringSidebar = false
     @State private var isOutlinePinned = false
+    @AppStorage("filesSidebarPinned") private var isFilesSidebarPinned = false
     @State private var scrollRequest: ScrollRequest?
     @State private var activeAnchorID: String?
 
-    init(documentState: DocumentState = DocumentState()) {
+    var onOpenFile: ((URL) -> Void)?
+
+    init(documentState: DocumentState = DocumentState(), appDelegate: AppDelegate, onOpenFile: ((URL) -> Void)? = nil) {
         _documentState = StateObject(wrappedValue: documentState)
+        self.appDelegate = appDelegate
+        self.onOpenFile = onOpenFile
     }
 
     private var canShowOutline: Bool {
@@ -46,6 +53,7 @@ struct ContentView: View {
                 scrollRequest: scrollRequest,
                 reloadToken: documentState.reloadToken,
                 zoomLevel: documentState.zoomLevel,
+                contentWidth: documentState.contentWidth,
                 findRequest: documentState.findRequest,
                 onActiveAnchorChange: { anchorID in
                     activeAnchorID = anchorID
@@ -56,6 +64,16 @@ struct ContentView: View {
 
     var body: some View {
         HStack(spacing: 0) {
+            if isFilesSidebarPinned {
+                FilesSidebar(
+                    recentFilesStore: recentFilesStore,
+                    currentFileURL: documentState.currentURL,
+                    onSelectFile: { url in
+                        onOpenFile?(url)
+                    }
+                )
+                .transition(.move(edge: .leading))
+            }
             documentView
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             if showPinnedOutline {
@@ -142,6 +160,20 @@ struct ContentView: View {
             }
         }
         .toolbar {
+            ToolbarItem(placement: .navigation) {
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isFilesSidebarPinned.toggle()
+                    }
+                }) {
+                    Label("Recent Files", systemImage: "sidebar.left")
+                        .labelStyle(.iconOnly)
+                        .font(.system(size: 13, weight: .semibold))
+                }
+                .foregroundColor(.secondary)
+                .symbolVariant(isFilesSidebarPinned ? .fill : .none)
+                .help(isFilesSidebarPinned ? "Hide Recent Files" : "Show Recent Files")
+            }
             if canShowOutline {
                 ToolbarItem(placement: .primaryAction) {
                     Button(action: {
@@ -156,6 +188,53 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
                     .symbolVariant(isOutlinePinned ? .fill : .none)
                     .help(isOutlinePinned ? "Hide Table of Contents" : "Show Table of Contents")
+                }
+            }
+        }
+        .overlay {
+            if appDelegate.isQuickOpenVisible {
+                ZStack {
+                    Color.black.opacity(0.3)
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            appDelegate.isQuickOpenVisible = false
+                        }
+
+                    VStack {
+                        QuickOpenView(
+                            isPresented: $appDelegate.isQuickOpenVisible,
+                            recentFilesStore: recentFilesStore,
+                            openTabs: appDelegate.getOpenTabs(),
+                            onSelectFile: { url in
+                                onOpenFile?(url)
+                            }
+                        )
+                        .padding(.top, 80)
+                        Spacer()
+                    }
+                }
+            }
+        }
+        .overlay {
+            if appDelegate.isGlobalSearchVisible {
+                ZStack {
+                    Color.black.opacity(0.3)
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            appDelegate.isGlobalSearchVisible = false
+                        }
+
+                    VStack {
+                        GlobalSearchView(
+                            isPresented: $appDelegate.isGlobalSearchVisible,
+                            recentFilesStore: recentFilesStore,
+                            onSelectResult: { url in
+                                onOpenFile?(url)
+                            }
+                        )
+                        .padding(.top, 80)
+                        Spacer()
+                    }
                 }
             }
         }

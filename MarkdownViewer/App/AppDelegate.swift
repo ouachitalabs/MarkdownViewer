@@ -2,13 +2,16 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     private var windowControllers: [ViewerWindowController] = []
     private let openFilesStore = OpenFilesStore.shared
     private var windowCloseObserver: Any?
     private var keyDownMonitor: Any?
     private var didRestoreOpenFiles = false
     private var isTerminating = false
+
+    @Published var isQuickOpenVisible = false
+    @Published var isGlobalSearchVisible = false
 
     func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls {
@@ -120,6 +123,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         activeDocumentState()?.resetZoom()
     }
 
+    func increaseContentWidth() {
+        activeDocumentState()?.increaseContentWidth()
+    }
+
+    func decreaseContentWidth() {
+        activeDocumentState()?.decreaseContentWidth()
+    }
+
+    func resetContentWidth() {
+        activeDocumentState()?.resetContentWidth()
+    }
+
     func showFindBar() {
         activeDocumentState()?.showFindBar()
     }
@@ -138,6 +153,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func selectPreviousTab() {
         activeDocumentWindow()?.selectPreviousTab(nil)
+    }
+
+    func closeCurrentTab() {
+        activeDocumentWindow()?.performClose(nil)
+    }
+
+    func showQuickOpen() {
+        isQuickOpenVisible = true
+    }
+
+    func showGlobalSearch() {
+        isGlobalSearchVisible = true
+    }
+
+    func getOpenTabs() -> [URL] {
+        return currentOpenFileURLs()
     }
 
     func selectTab(at index: Int) {
@@ -236,7 +267,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func openWindow(with documentState: DocumentState) {
-        let contentView = ContentView(documentState: documentState)
+        let contentView = ContentView(documentState: documentState, appDelegate: self) { [weak self] url in
+            self?.openFile(at: url)
+        }
         let hostingController = NSHostingController(rootView: contentView)
         let window = NSWindow(contentViewController: hostingController)
         window.setContentSize(NSSize(width: 600, height: 400))

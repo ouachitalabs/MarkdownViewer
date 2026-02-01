@@ -4,12 +4,41 @@ import Foundation
 import Markdown
 
 class DocumentState: ObservableObject {
+    private static let zoomLevelKey = "zoomLevel"
+    private static let contentWidthKey = "contentWidth"
+    static let zoomChangedNotification = Notification.Name("DocumentStateZoomChanged")
+    static let contentWidthChangedNotification = Notification.Name("DocumentStateContentWidthChanged")
+
     @Published var htmlContent: String = ""
     @Published var title: String = "Markdown Viewer"
     @Published var fileChanged: Bool = false
     @Published var outlineItems: [OutlineItem] = []
     @Published var reloadToken: UUID?
-    @Published var zoomLevel: CGFloat = 1.0
+    @Published var zoomLevel: CGFloat {
+        didSet {
+            guard !isSyncingZoom else { return }
+            UserDefaults.standard.set(zoomLevel, forKey: Self.zoomLevelKey)
+            NotificationCenter.default.post(
+                name: Self.zoomChangedNotification,
+                object: self,
+                userInfo: ["zoomLevel": zoomLevel]
+            )
+        }
+    }
+    private var isSyncingZoom = false
+
+    @Published var contentWidth: CGFloat {
+        didSet {
+            guard !isSyncingWidth else { return }
+            UserDefaults.standard.set(contentWidth, forKey: Self.contentWidthKey)
+            NotificationCenter.default.post(
+                name: Self.contentWidthChangedNotification,
+                object: self,
+                userInfo: ["contentWidth": contentWidth]
+            )
+        }
+    }
+    private var isSyncingWidth = false
     @Published var isShowingFindBar: Bool = false
     @Published var findQuery: String = ""
     @Published var findRequest: FindRequest?
@@ -18,13 +47,52 @@ class DocumentState: ObservableObject {
     private var fileMonitor: DispatchSourceFileSystemObject?
     private var lastModificationDate: Date?
     private let recentFilesStore: RecentFilesStore
+    private var zoomObserver: Any?
+    private var widthObserver: Any?
 
     init(recentFilesStore: RecentFilesStore = .shared) {
         self.recentFilesStore = recentFilesStore
+        let storedZoom = UserDefaults.standard.double(forKey: Self.zoomLevelKey)
+        self.zoomLevel = storedZoom > 0 ? CGFloat(storedZoom) : 1.0
+
+        let storedWidth = UserDefaults.standard.double(forKey: Self.contentWidthKey)
+        self.contentWidth = storedWidth > 0 ? CGFloat(storedWidth) : 980
+
+        zoomObserver = NotificationCenter.default.addObserver(
+            forName: Self.zoomChangedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self = self,
+                  notification.object as? DocumentState !== self,
+                  let newZoom = notification.userInfo?["zoomLevel"] as? CGFloat else { return }
+            self.isSyncingZoom = true
+            self.zoomLevel = newZoom
+            self.isSyncingZoom = false
+        }
+
+        widthObserver = NotificationCenter.default.addObserver(
+            forName: Self.contentWidthChangedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self = self,
+                  notification.object as? DocumentState !== self,
+                  let newWidth = notification.userInfo?["contentWidth"] as? CGFloat else { return }
+            self.isSyncingWidth = true
+            self.contentWidth = newWidth
+            self.isSyncingWidth = false
+        }
     }
 
     deinit {
         stopMonitoring()
+        if let zoomObserver {
+            NotificationCenter.default.removeObserver(zoomObserver)
+        }
+        if let widthObserver {
+            NotificationCenter.default.removeObserver(widthObserver)
+        }
     }
 
     func loadFile(at url: URL) {
@@ -88,6 +156,18 @@ class DocumentState: ObservableObject {
 
     func resetZoom() {
         zoomLevel = 1.0
+    }
+
+    func increaseContentWidth() {
+        contentWidth = min(contentWidth + 100, 2000)
+    }
+
+    func decreaseContentWidth() {
+        contentWidth = max(contentWidth - 100, 500)
+    }
+
+    func resetContentWidth() {
+        contentWidth = 980
     }
 
     func showFindBar() {

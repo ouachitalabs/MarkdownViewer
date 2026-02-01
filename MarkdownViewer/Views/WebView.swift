@@ -13,6 +13,7 @@ struct WebView: NSViewRepresentable {
     let scrollRequest: ScrollRequest?
     let reloadToken: UUID?
     let zoomLevel: CGFloat
+    let contentWidth: CGFloat
     let findRequest: FindRequest?
     let onActiveAnchorChange: ((String?) -> Void)?
 
@@ -67,6 +68,11 @@ struct WebView: NSViewRepresentable {
             webView.evaluateJavaScript("document.body.style.zoom = '\(percentage)%'", completionHandler: nil)
         }
 
+        if contentWidth != context.coordinator.lastContentWidth {
+            context.coordinator.lastContentWidth = contentWidth
+            webView.evaluateJavaScript("document.body.style.maxWidth = '\(Int(contentWidth))px'", completionHandler: nil)
+        }
+
         if let request = findRequest {
             context.coordinator.requestFind(request, in: webView)
         }
@@ -81,6 +87,7 @@ struct WebView: NSViewRepresentable {
         var lastReloadToken: UUID?
         var savedScrollY: CGFloat = 0
         var lastZoomLevel: CGFloat = 1.0
+        var lastContentWidth: CGFloat = 980
         var pendingFindRequest: FindRequest?
         var lastFindToken: UUID?
         var lastActiveAnchorID: String?
@@ -109,6 +116,10 @@ struct WebView: NSViewRepresentable {
             if lastZoomLevel != 1.0 {
                 let percentage = Int(lastZoomLevel * 100)
                 webView.evaluateJavaScript("document.body.style.zoom = '\(percentage)%'", completionHandler: nil)
+            }
+
+            if lastContentWidth != 980 {
+                webView.evaluateJavaScript("document.body.style.maxWidth = '\(Int(lastContentWidth))px'", completionHandler: nil)
             }
 
             if savedScrollY > 0 {

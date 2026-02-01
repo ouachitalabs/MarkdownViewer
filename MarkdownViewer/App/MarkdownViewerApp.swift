@@ -7,7 +7,9 @@ struct MarkdownViewerApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ContentView(appDelegate: appDelegate) { url in
+                appDelegate.openFile(at: url)
+            }
         }
         .commands {
             CommandGroup(replacing: .newItem) {
@@ -36,6 +38,11 @@ struct MarkdownViewerApp: App {
                 }
                 .keyboardShortcut("t", modifiers: .command)
 
+                Button("Close Tab") {
+                    appDelegate.closeCurrentTab()
+                }
+                .keyboardShortcut("w", modifiers: .command)
+
                 Button("Next Tab") {
                     appDelegate.selectNextTab()
                 }
@@ -61,6 +68,13 @@ struct MarkdownViewerApp: App {
                     appDelegate.reloadActiveDocument()
                 }
                 .keyboardShortcut("r", modifiers: .command)
+
+                Divider()
+
+                Button("Quick Open...") {
+                    appDelegate.showQuickOpen()
+                }
+                .keyboardShortcut("p", modifiers: .command)
             }
             CommandGroup(after: .textEditing) {
                 Divider()
@@ -69,6 +83,11 @@ struct MarkdownViewerApp: App {
                     appDelegate.showFindBar()
                 }
                 .keyboardShortcut("f", modifiers: .command)
+
+                Button("Find in Files...") {
+                    appDelegate.showGlobalSearch()
+                }
+                .keyboardShortcut("f", modifiers: [.command, .shift])
 
                 Button("Find Next") {
                     appDelegate.findNext()
@@ -95,6 +114,23 @@ struct MarkdownViewerApp: App {
                     appDelegate.resetZoom()
                 }
                 .keyboardShortcut("0", modifiers: .command)
+
+                Divider()
+
+                Button("Increase Content Width") {
+                    appDelegate.increaseContentWidth()
+                }
+                .keyboardShortcut("+", modifiers: [.command, .option])
+
+                Button("Decrease Content Width") {
+                    appDelegate.decreaseContentWidth()
+                }
+                .keyboardShortcut("-", modifiers: [.command, .option])
+
+                Button("Reset Content Width") {
+                    appDelegate.resetContentWidth()
+                }
+                .keyboardShortcut("0", modifiers: [.command, .option])
             }
         }
     }
