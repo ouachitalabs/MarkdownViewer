@@ -205,19 +205,22 @@ Build a structured prompt from the comments:
 You are editing the markdown file at: /path/to/document.md
 
 The user has left the following edit comments on the document. Each comment
-references specific lines and includes the user's requested change.
-Apply ALL of the pending changes to the file.
+has an ID, references specific lines, and includes the user's requested change.
+
+Read the file, apply ALL of the pending changes directly to the file using
+your Edit tool, then return a structured response reporting the result for
+each comment.
 
 ## Comments
 
-### Comment 1 (lines 5-7)
+### Comment 1 (id: 1, lines 5-7)
 Selected text:
 > The quick brown fox jumps over the lazy dog.
 
 Requested edit:
 "Make this more formal and add a citation"
 
-### Comment 2 (lines 12-12)
+### Comment 2 (id: 4, lines 12-12)
 Selected text:
 > ## Teh Architecture
 
@@ -228,14 +231,17 @@ Requested edit:
 
 Apply each requested edit to the file. Preserve the overall structure
 and formatting. Only modify the sections referenced by the comments.
+After editing, return your structured response with the status of each
+comment using the comment IDs above.
 ```
 
 Key context engineering decisions:
-- Include the full file path so Claude can read/write it
+- Include the full file path so Claude reads/edits it directly
 - Quote the selected text so Claude can locate it even if lines shift
-- Number the comments for traceability
+- Include comment IDs so the structured output maps back to our DB
 - Keep the system prompt focused: "apply edits, preserve structure"
-- Optionally append `--resume <session-id>` context (Phase 4)
+- `--json-schema` enforces the response contract (see 3c)
+- Optionally `--resume <session-id>` to carry prior conversation context (Phase 4)
 
 #### 3b. ClaudeCodeRunner
 
@@ -247,8 +253,7 @@ class ClaudeCodeRunner {
         filePath: String,
         comments: [Comment],
         sessionId: String?,     // optional resume
-        onOutput: @escaping (String) -> Void,
-        onComplete: @escaping (Bool) -> Void
+        onComplete: @escaping (Result<ClaudeResponse, Error>) -> Void
     )
 }
 ```
@@ -257,19 +262,61 @@ Implementation:
 - Build the prompt string per 3a
 - Spawn `Process()` with:
   - `/usr/bin/env claude`
-  - Arguments: `-p`, `--dangerously-skip-permissions`, and optionally `--resume`, `<session-id>`
+  - Arguments: `-p`, `--dangerously-skip-permissions`, `--output-format json`, `--json-schema <schema>`, and optionally `--resume`, `<session-id>`
   - Pipe the prompt via stdin
-- Stream stdout/stderr for progress display
-- On completion, update comment statuses in SQLite
-- Trigger file-reload in DocumentState (existing file-change detection should handle this automatically since the file watcher already exists in `AppDelegate`)
+- Claude edits the file directly (it has full tool access via `--dangerously-skip-permissions`), then returns structured output
+- Parse the JSON response from stdout, extract `structured_output`
+- Update comment statuses and store Claude's per-comment responses in SQLite
+- The existing file-change watcher in `AppDelegate` auto-detects the edit and triggers reload
 
-#### 3c. Progress UI
+#### 3c. Structured output schema
 
-While Claude is working:
-- Show an inline progress indicator in the comment sidebar
-- Stream Claude's output into a collapsible "Claude Response" section per comment (or a shared log view at the bottom)
-- On success: mark comments as `applied`, show green checkmarks
-- On error: mark as `error`, show the error message
+Use `--json-schema` to enforce a response contract. Claude edits the file itself, then reports what it did:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "comments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "comment_id": { "type": "integer" },
+          "status": { "type": "string", "enum": ["applied", "rejected", "error"] },
+          "response": { "type": "string" }
+        },
+        "required": ["comment_id", "status", "response"]
+      }
+    },
+    "summary": { "type": "string" }
+  },
+  "required": ["comments", "summary"]
+}
+```
+
+This gives us a clean mapping: for each comment ID, Claude reports whether it applied the edit, skipped it, or hit an error, along with a short explanation. The `summary` field provides an overall description of changes made.
+
+The full CLI invocation looks like:
+
+```bash
+claude -p "<prompt>" \
+  --dangerously-skip-permissions \
+  --output-format json \
+  --json-schema '<schema>' \
+  --resume "<session-id>"  # optional
+```
+
+The outer JSON envelope from `--output-format json` contains `session_id` (useful for chaining follow-ups) and `structured_output` (our schema above).
+
+#### 3d. Completion UI
+
+After Claude finishes:
+- Parse the structured response and update each comment's status in SQLite
+- Store Claude's per-comment `response` text in the `claude_responses` table
+- Refresh the comment sidebar to show updated statuses (green checkmark for applied, red for error)
+- The file-change watcher triggers a document reload automatically — user sees the updated rendered markdown
+- Show a brief banner or toast: "Claude applied 3/4 comments" with a link to view details
 
 **Files to add:**
 - `Services/ClaudeCodeRunner.swift`
