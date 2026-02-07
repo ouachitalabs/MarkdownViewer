@@ -20,39 +20,25 @@ The goal is to close this loop inside Markdown Viewer itself.
 
 ## Architecture
 
-```
-┌────────────────────────────────────────────────────────────┐
-│                    Markdown Viewer.app                      │
-│                                                            │
-│  ┌──────────────┐  ┌────────────────┐  ┌───────────────┐  │
-│  │  WKWebView   │  │ Comment Panel  │  │ Session Picker│  │
-│  │  (rendered   │◄─┤ (sidebar list  │  │ (dropdown of  │  │
-│  │   markdown   │  │  of comments)  │  │ claude sesns) │  │
-│  │  + highlight │  └───────┬────────┘  └──────┬────────┘  │
-│  │   overlays)  │          │                   │           │
-│  └──────┬───────┘          │                   │           │
-│         │                  ▼                   ▼           │
-│         │          ┌──────────────┐   ┌────────────────┐   │
-│         │          │   SQLite DB  │   │ Claude Session │   │
-│         └─────────►│  (comments,  │   │   Reader       │   │
-│    JS ↔ Swift      │  positions,  │   │ (~/.claude/)   │   │
-│    bridge msgs     │  responses)  │   └────────┬───────┘   │
-│                    └──────┬───────┘            │           │
-│                           │                    │           │
-│                    ┌──────▼────────────────────▼───────┐   │
-│                    │     Claude Code CLI Runner        │   │
-│                    │  claude -p --dangerously-skip-    │   │
-│                    │  permissions [--resume <id>]      │   │
-│                    └──────────────┬────────────────────┘   │
-│                                   │                        │
-└───────────────────────────────────┼────────────────────────┘
-                                    │ Process()
-                                    ▼
-                            ┌──────────────┐
-                            │ claude CLI   │
-                            │ (installed   │
-                            │  on $PATH)   │
-                            └──────────────┘
+```mermaid
+graph TD
+    subgraph app["Markdown Viewer.app"]
+        WKWebView["WKWebView<br/>(rendered markdown<br/>+ highlight overlays)"]
+        CommentPanel["Comment Panel<br/>(sidebar list of comments)"]
+        SessionPicker["Session Picker<br/>(dropdown of Claude sessions)"]
+        SQLite["SQLite DB<br/>(comments, positions, responses)"]
+        SessionReader["Claude Session Reader<br/>(~/.claude/)"]
+        Runner["Claude Code CLI Runner<br/>claude -p --dangerously-skip-permissions<br/>[--resume &lt;id&gt;]"]
+
+        CommentPanel -->|"selected text<br/>+ source lines"| WKWebView
+        WKWebView -->|"JS ↔ Swift<br/>bridge msgs"| SQLite
+        CommentPanel --> SQLite
+        SessionPicker --> SessionReader
+        SQLite --> Runner
+        SessionReader --> Runner
+    end
+
+    Runner -->|"Process()"| Claude["claude CLI<br/>(installed on $PATH)"]
 ```
 
 ---
